@@ -41,44 +41,62 @@ export async function buildServer(pool: AccountPool) {
   app.post("/v1/chat/completions", { preHandler: requireKey }, async (req, reply) => {
     const body = req.body as any;
     const model = (body.model || config.defaultModel).replace(/^.*\//, "");
-    const messages = body.messages || [];
+    const messages: Array<{ role: string; content: string }> = ((body.messages || []) as any[]).map((m: any) => ({
+      role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
+      content: typeof m.content === "string" ? m.content
+        : Array.isArray(m.content) ? m.content.map((p: any) => p?.text ?? "").join("\n") : String(m.content ?? ""),
+    })).filter(m => m.content.length);
     if (!messages.length) return reply.code(400).send({ error: { message: "messages required" } });
-    const prompt = transcript(messages);
     const id = "chatcmpl-" + crypto.randomBytes(12).toString("hex");
     const created = Math.floor(Date.now() / 1000);
     const t0 = Date.now();
+    const opts = {
+      temperature: body.temperature,
+      topP: body.top_p,
+      maxTokens: body.max_tokens,
+    };
 
     let result;
     try {
-      result = await pool.chat(prompt, model);
+      if (body.stream) {
+        reply.raw.writeHead(200, {
+          "content-type": "text/event-stream", "cache-control": "no-cache",
+          connection: "keep-alive", "x-accel-buffering": "no",
+        });
+        const sse = (obj: any) => reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
+        const chunk = (delta: any) => ({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: null }] });
+        sse(chunk({ role: "assistant" }));
+        let accName = "-", via = "-";
+        try {
+          result = await pool.chatMessages(messages, model, opts, (chunks) => {
+            for (const c of chunks) {
+              if (c.kind === "thinking" && c.text) sse(chunk({ reasoning_content: c.text }));
+              else if (c.kind === "text" && c.text) sse(chunk({ content: c.text }));
+            }
+          });
+          accName = result.account; via = result.via;
+        } catch (err: any) {
+          pushLog({ t: t0, model, account: "-", ms: Date.now() - t0, ok: false, error: String(err?.message || err), stream: true, promptPreview: messages[messages.length - 1]?.content.slice(0, 120) });
+          sse(chunk({ content: "\n[pool error] " + String(err?.message || err) }));
+        }
+        sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], _account: accName, _via: via });
+        reply.raw.write("data: [DONE]\n\n");
+        reply.raw.end();
+        if (result) pushLog({ t: t0, model, account: result.account, ms: result.durationMs, ok: true, stream: true, promptPreview: messages[messages.length - 1]?.content.slice(0, 120) });
+        return;
+      }
+      result = await pool.chatMessages(messages, model, opts);
     } catch (err: any) {
-      pushLog({ t: t0, model, account: "-", ms: Date.now() - t0, ok: false, error: String(err?.message || err), stream: !!body.stream, promptPreview: prompt.slice(0, 120) });
+      pushLog({ t: t0, model, account: "-", ms: Date.now() - t0, ok: false, error: String(err?.message || err), stream: false, promptPreview: messages[messages.length - 1]?.content.slice(0, 120) });
       return reply.code(502).send({ error: { message: String(err?.message || err) } });
     }
-    pushLog({ t: t0, model, account: result.account, ms: result.durationMs, ok: true, stream: !!body.stream, promptPreview: prompt.slice(0, 120) });
-
-    if (!body.stream) {
-      return {
-        id, object: "chat.completion", created, model,
-        choices: [{ index: 0, message: { role: "assistant", content: result.text, reasoning_content: result.thinking || undefined }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        _account: result.account,
-      };
-    }
-    reply.raw.writeHead(200, {
-      "content-type": "text/event-stream", "cache-control": "no-cache",
-      connection: "keep-alive", "x-accel-buffering": "no",
-    });
-    const sse = (obj: any) => reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
-    const chunk = (delta: any) => ({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: null }] });
-    sse(chunk({ role: "assistant" }));
-    for (const c of result.chunks) {
-      if (c.kind === "thinking" && c.text) sse(chunk({ reasoning_content: c.text }));
-      else if (c.kind === "text" && c.text) sse(chunk({ content: c.text }));
-    }
-    sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-    reply.raw.write("data: [DONE]\n\n");
-    reply.raw.end();
+    pushLog({ t: t0, model, account: result.account, ms: result.durationMs, ok: true, stream: false, promptPreview: messages[messages.length - 1]?.content.slice(0, 120) });
+    return {
+      id, object: "chat.completion", created, model,
+      choices: [{ index: 0, message: { role: "assistant", content: result.text, reasoning_content: result.thinking || undefined }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      _account: result.account, _via: result.via,
+    };
   });
 
   // ---- admin / dashboard ----

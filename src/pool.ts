@@ -101,6 +101,52 @@ export class AccountPool {
     const w = this.waiters.shift(); w?.();
   }
 
+  /** v2 path: real messages + streaming; falls back to legacy UI transcript if the oracle can't bootstrap. */
+  async chatMessages(
+    messages: Array<{ role: string; content: string }>,
+    model: string,
+    opts: { temperature?: number; topP?: number; maxTokens?: number; thinkingLevel?: number } = {},
+    onChunks?: (chunks: any[]) => void,
+  ): Promise<{ text: string; thinking: string; durationMs: number; account: string; via: string }> {
+    const acc = await this.acquire();
+    const t0 = Date.now();
+    try {
+      let result;
+      let via = "v2";
+      try {
+        result = await acc.driver!.chatV2(messages, model, opts, onChunks);
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (/raid|oracle|anchor|breakpoint/i.test(msg)) {
+          if (process.env.AIS_DEBUG) console.log(`[pool] v2 failed for ${acc.name}, falling back legacy: ${msg}`);
+          via = "legacy";
+          result = await acc.driver!.chat(transcript(messages), model);
+          if (onChunks) onChunks(result.chunks);
+        } else throw err;
+      }
+      acc.stats.requests++;
+      acc.stats.totalMs = (acc.stats.totalMs ?? 0) + result.durationMs;
+      acc.stats.avgMs = Math.round(acc.stats.totalMs / acc.stats.requests);
+      this.release(acc);
+      return { text: result.text, thinking: result.thinking, durationMs: result.durationMs, account: acc.name, via };
+    } catch (err: any) {
+      acc.stats.errors++;
+      acc.stats.lastError = String(err?.message || err);
+      const msg = String(err?.message || err);
+      if (/RESOURCE_EXHAUSTED|quota|429/i.test(msg)) {
+        acc.state = "cooldown";
+        acc.stats.quotaUntil = Date.now() + 10 * 60_000;
+      } else if (/not logged in|textarea|bot check|PERMISSION_DENIED/i.test(msg)) {
+        acc.state = "logged_out";
+      } else {
+        this.release(acc);
+      }
+      throw err;
+    } finally {
+      acc.stats.lastUsed = t0;
+    }
+  }
+
   async chat(prompt: string, model: string, signal?: AbortSignal): Promise<ChatResult & { account: string }> {
     const acc = await this.acquire();
     const t0 = Date.now();

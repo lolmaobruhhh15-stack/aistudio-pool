@@ -43,6 +43,24 @@ async function serve() {
     pool.accounts.push(acc);
     console.log(`attached account '${name}' via CDP :${process.env.ATTACH_PORT} (${acc.state})`);
   }
+  // ATTACH_PORTS="main=9222,acc2=9224" — multiple attached accounts
+  if (process.env.ATTACH_PORTS) {
+    const { Account } = await import("./pool.js");
+    for (const spec of process.env.ATTACH_PORTS.split(",").map(s => s.trim()).filter(Boolean)) {
+      const [name, port] = spec.split("=");
+      if (!name || !port) continue;
+      try {
+        const drv = await AisDriver.attach(Number(port), name);
+        const acc = new Account(name);
+        acc.driver = drv;
+        acc.state = (await drv.isLoggedIn()) ? "idle" : "logged_out";
+        pool.accounts.push(acc);
+        console.log(`attached account '${name}' via CDP :${port} (${acc.state})`);
+      } catch (e: any) {
+        console.log(`attach FAILED '${name}' :${port}: ${e?.message || e}`);
+      }
+    }
+  }
   const app = await buildServer(pool);
   await app.listen({ port: config.port, host: "0.0.0.0" });
   console.log(`aistudio-pool listening on :${config.port} (${pool.accounts.length} accounts, headless=${headless})`);

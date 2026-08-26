@@ -1,9 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
 import net from "node:net";
 import { Cdp, waitFor, type CdpEvent } from "./cdp.js";
-import { parseGenerateContent, mergeChunks, type ParsedChunk } from "./parse.js";
+import { parseGenerateContent, parseFrame, mergeChunks, FrameSplitter, type ParsedChunk } from "./parse.js";
+import {
+  contentHash, locateAnchor, mintWithOracle, hasOracleExpr,
+  RAID_HOOK_SETUP, RAID_STEAL_ON_FRAME, uiInjectJs,
+} from "./mint.js";
 import { findChrome, config } from "./config.js";
 
 const NEW_CHAT = (model: string) => `https://aistudio.google.com/prompts/new_chat?model=${encodeURIComponent(model)}`;
@@ -31,8 +36,52 @@ async function httpJson(port: number, p: string, method = "GET") {
   return r.json();
 }
 
-const RESET_STATE_JS = `
-(() => {
+const RPC_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent";
+const SAFETY = [[null, null, 7, 5], [null, null, 8, 5], [null, null, 9, 5], [null, null, 10, 5]];
+
+export interface ChatMessage { role: string; content: string }
+export interface GenOpts {
+  temperature?: number; topP?: number; maxTokens?: number; thinkingLevel?: number;
+}
+
+function buildBody(model: string, messages: ChatMessage[], token: string, opts: GenOpts, timezone: string): any[] {
+  const turns = messages
+    .filter(m => m.content?.trim() && m.role !== "system")
+    .map(m => [[[null, m.content]], m.role === "assistant" ? "model" : "user"]);
+  const sys = messages.filter(m => m.role === "system").map(m => m.content).join("\n\n");
+  if (sys) turns.unshift([[[null, "[System instructions]\n" + sys]], "user"]);
+  const thinkingTail = opts.thinkingLevel ?? (model.includes("pro") ? 3 : 2);
+  return [
+    `models/${model}`,
+    turns,
+    SAFETY,
+    [null, null, null,
+      opts.maxTokens ?? 65536, 1, opts.topP ?? 0.95, 64,
+      null, null, null, null, null, null, 1,
+      null, null,
+      [1, null, null, thinkingTail],
+    ],
+    token,
+    null,
+    [[null, null, null, [null, [[]]]]],
+    null, null, null,
+    1, null, null,
+    [[null, null, timezone]],
+  ];
+}
+
+function authFrom(cookies: any[], origin = "https://aistudio.google.com"): { cookie: string; authorization: string } {
+  const cookie = cookies
+    .filter(c => (c.domain || "").endsWith("google.com"))
+    .map(c => `${c.name}=${c.value}`).join("; ");
+  const sapisid = cookies.find(c => c.name === "SAPISID" && (c.domain || "") === ".google.com")?.value;
+  if (!sapisid) throw new Error("no SAPISID cookie — account not signed in");
+  const ts = Math.floor(Date.now() / 1000);
+  const h = crypto.createHash("sha1").update(`${ts} ${sapisid} ${origin}`).digest("hex");
+  return { cookie, authorization: `SAPISIDHASH ${ts}_${h} SAPISID1PHASH ${ts}_${h} SAPISID3PHASH ${ts}_${h}` };
+}
+
+const RESET_STATE_JS = `(() => {
   // close popups (surveys etc.)
   document.querySelectorAll('button').forEach(b => {
     const l = (b.getAttribute('aria-label') || '').toLowerCase();
@@ -46,26 +95,6 @@ const RESET_STATE_JS = `
     x.click();
   }
   return chips.length;
-})()`;
-
-const INJECT_JS = (prompt: string) => `
-(async () => {
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  let ta = null;
-  for (let i = 0; i < 80; i++) { ta = document.querySelector('textarea'); if (ta) break; await sleep(500); }
-  if (!ta) return JSON.stringify({ ok: false, err: 'NO_TEXTAREA' });
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-  setter.call(ta, ${JSON.stringify(prompt)});
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
-  await sleep(700);
-  const btns = [...document.querySelectorAll('button')];
-  const run = document.querySelector('button.run-button:not([disabled])')
-    || btns.find(b => (b.getAttribute('aria-label') || '').trim().toLowerCase() === 'run' && !b.disabled)
-    || btns.find(b => /^(run|send)/i.test((b.getAttribute('aria-label') || '').trim())
-        && !/close|panel|settings/i.test(b.getAttribute('aria-label') || '') && !b.disabled);
-  if (run) { run.click(); return JSON.stringify({ ok: true, via: 'button' }); }
-  ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
-  return JSON.stringify({ ok: true, via: 'ctrl-enter' });
 })()`;
 
 export class AisDriver {
@@ -210,7 +239,7 @@ export class AisDriver {
     return r.result?.value;
   }
 
-  /** Run one chat turn in a fresh chat. Serial per driver (one page). */
+  /** UI-driven chat (legacy fallback path). Run one chat turn in a fresh chat. */
   async chat(prompt: string, model = config.defaultModel, signal?: AbortSignal): Promise<ChatResult> {
     await this.ensureConnected();
     const t0 = Date.now();
@@ -220,7 +249,7 @@ export class AisDriver {
     const ready = await this.hasTextarea(30_000);
     if (!ready) throw new Error("AI Studio page never showed a prompt textarea (not logged in? bot check?)");
     await this.evalJs(RESET_STATE_JS, 15_000).catch(() => {});
-    const trigRaw = await this.evalJs(INJECT_JS(prompt), 60_000, true);
+    const trigRaw = await this.evalJs(uiInjectJs(prompt), 60_000, true);
     let trig: any = {};
     try { trig = JSON.parse(trigRaw); } catch {}
     if (!trig?.ok) throw new Error("inject failed: " + (trig?.err || trigRaw));
@@ -246,6 +275,182 @@ export class AisDriver {
     const chunks = parseGenerateContent(raw);
     const merged = mergeChunks(chunks);
     return { ok: true, thinking: merged.thinking, text: merged.text, chunks, durationMs: Date.now() - t0, rawBody: raw };
+  }
+
+  // ---------------- v2: mint-oracle + raw-HTTP path ----------------
+
+  private oracleModel: string | null = null;
+
+  /** True if the raided mint oracle is alive in the page for this model. */
+  private async oracleAlive(model: string): Promise<boolean> {
+    if (this.oracleModel !== model) return false;
+    try {
+      const r = await this.cdp.send("Runtime.evaluate", { expression: hasOracleExpr(), returnByValue: true }, 10_000);
+      return r.result?.value === true;
+    } catch { return false; }
+  }
+
+  /**
+   * Bootstrap the mint oracle for a model: park the page on new_chat?model=..., then
+   * breakpoint-raid one UI probe chat to steal {xv, gp} into window.__raid.
+   */
+  async ensureOracle(model: string): Promise<void> {
+    const dbg = process.env.AIS_DEBUG ? (m: string) => console.log(`[oracle:${this.name}] ${m}`) : () => {};
+    await this.ensureConnected();
+    if (await this.oracleAlive(model)) { dbg("alive"); return; }
+
+    const onPage = await this.evalJs(
+      `location.search.includes('model=' + ${JSON.stringify(model)}) || location.pathname !== '/prompts/new_chat' ? location.href : ''`,
+      10_000).catch(() => "");
+    const url: string = onPage || "";
+    if (!url.includes(encodeURIComponent(model)) && !url.includes(model)) {
+      dbg("navigating to fresh new_chat for " + model);
+      await this.navigate(NEW_CHAT(model));
+      await waitFor(async () => !!(await this.hasTextarea(15_000).catch(() => false)), 25_000, "page load");
+      await new Promise(r => setTimeout(r, 4000));
+    } else dbg("staying on " + url.slice(0, 70));
+
+    // breakpoint at the token-write; the regex anchor is found from the LIVE bundle text
+    await this.cdp.send("Debugger.enable", { maxScriptsCacheSize: 1_000_000_000 }).catch(() => {});
+    let anchor: { line: number; col: number }[] | null = null;
+    for (let i = 0; i < 3; i++) {
+      try { anchor = await locateAnchor(this.cdp); break; }
+      catch (e: any) {
+        dbg("locateAnchor try " + i + ": " + String(e?.message || e).slice(0, 80));
+        if (i === 2 || !/collected|context|timeout|no bundle url/i.test(String(e?.message || e))) throw e;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    if (!anchor) throw new Error("raid anchor not found (bundle updated?)");
+    dbg(`anchors: ${anchor.map(a => a.line + ":" + a.col).join(" | ")}`);
+    const bps: Array<{ id: string; loc: any }> = [];
+    for (const a of anchor) {
+      const bp = await this.cdp.send("Debugger.setBreakpointByUrl", {
+        lineNumber: a.line, columnNumber: a.col,
+        urlRegex: "gstatic\\.com/.*m=_b",
+      }, 15_000).catch(() => null);
+      if (bp?.locations?.length) bps.push({ id: bp.breakpointId, loc: bp.locations[0] });
+    }
+    if (!bps.length) throw new Error("raid anchor not resolved (bundle updated?)");
+    dbg("breakpoints set: " + bps.length);
+
+    await this.evalJs(RAID_HOOK_SETUP, 10_000).catch(() => {});
+    await this.evalJs(RESET_STATE_JS, 10_000).catch(() => {});
+
+    // fire probe chat; pause event will arrive asynchronously
+    const probe = "Reply with exactly ORACLE_BOOT_" + Math.floor(Math.random() * 9000 + 1000) + " and nothing else.";
+    const pauseP = this.waitPause(90_000);
+    // NOTE: do NOT await the probe's evaluate — the breakpoint pauses the page mid-eval
+    this.evalJs(uiInjectJs(probe), 5_000, true).catch(e => dbg("probe eval: " + String(e).slice(0, 80)));
+    const paused = await pauseP;
+    dbg("paused, frames=" + paused.callFrames.length);
+
+    // steal from the paused frame
+    const steal = await this.cdp.send("Debugger.evaluateOnCallFrame", {
+      callFrameId: paused.callFrames[0].callFrameId,
+      expression: RAID_STEAL_ON_FRAME, returnByValue: true,
+    }, 15_000).catch(() => null);
+    const stolen = steal?.result?.value === "stolen";
+    dbg("steal: " + (stolen ? "ok" : JSON.stringify(steal)?.slice(0, 120)));
+    for (const b of bps) await this.cdp.send("Debugger.removeBreakpoint", { breakpointId: b.id }).catch(() => {});
+    await this.cdp.send("Debugger.resume").catch(() => {});
+    await this.cdp.send("Debugger.disable").catch(() => {});
+    if (!stolen) throw new Error("raid failed: could not steal oracle from frame");
+
+    // drain the probe's own GenerateContent capture so it can't confuse legacy paths
+    this.bodies.clear();
+    this.oracleModel = model;
+  }
+
+  private waitPause(timeoutMs: number): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); reject(new Error("raid timeout: breakpoint never hit")); }, timeoutMs);
+      const onEvent = (ev: CdpEvent) => {
+        if (ev.method === "Debugger.paused") {
+          cleanup();
+          resolve(ev.params);
+        }
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        // listener removal: our Cdp has no remove; harmless to leave (resolves once)
+      };
+      this.cdp.onEvent(onEvent);
+    });
+  }
+
+  /**
+   * v2 chat: mint token for arbitrary messages, raw-HTTP send, TRUE streaming.
+   * onChunks fires per network chunk as frames complete.
+   */
+  async chatV2(
+    messages: ChatMessage[],
+    model = config.defaultModel,
+    opts: GenOpts = {},
+    onChunks?: (chunks: ParsedChunk[]) => void,
+  ): Promise<ChatResult> {
+    await this.ensureOracle(model);
+    const t0 = Date.now();
+
+    const sys = messages.filter(m => m.role === "system").map(m => m.content).join("\n\n");
+    const turns: ChatMessage[] = messages
+      .filter(m => m.content?.trim() && m.role !== "system")
+      .map(m => ({ role: m.role, content: m.content }));
+    if (sys) turns.unshift({ role: "user", content: "[System instructions]\n" + sys });
+
+    const hex = contentHash(turns.map(t => t.content));
+    const token = await mintWithOracle(this.cdp, hex);
+
+    const cookies = (await this.cdp.send("Storage.getCookies", {}, 15_000)).cookies || [];
+    const { cookie, authorization } = authFrom(cookies);
+    const tz = await this.evalJs("Intl.DateTimeFormat().resolvedOptions().timeZone", 10_000).catch(() => "UTC");
+    const body = JSON.stringify(buildBody(model, turns, token, opts, String(tz)));
+
+    const res = await fetch(RPC_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": authorization,
+        "Content-Type": "application/json+protobuf",
+        "X-Goog-Api-Key": "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs",
+        "X-Goog-AuthUser": "0",
+        "X-Goog-Ext-519733851-bin": "CAESAUwwATgEQABQBGICQkRwAXgB",
+        "X-User-Agent": "grpc-web-javascript/0.1",
+        "Origin": "https://aistudio.google.com",
+        "Referer": "https://aistudio.google.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "Cookie": cookie,
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const errText = (await res.text()).slice(0, 300);
+      const m = errText.match(/\[(\d+),"([^"]{0,200})/);
+      const code = m ? Number(m[1]) : res.status;
+      const msg = m ? m[2] : errText;
+      if (code === 8 || /quota|RESOURCE_EXHAUSTED/i.test(msg)) throw new Error("RESOURCE_EXHAUSTED: " + msg);
+      if (code === 7) { this.oracleModel = null; throw new Error("PERMISSION_DENIED: " + msg); }
+      throw new Error(`RPC_ERROR_${code}: ` + msg);
+    }
+
+    const splitter = new FrameSplitter();
+    const chunks: ParsedChunk[] = [];
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const frameChunks of splitter.push(dec.decode(value, { stream: true }))) {
+        chunks.push(...frameChunks);
+        onChunks?.(frameChunks);
+      }
+    }
+    for (const frameChunks of splitter.push("")) {
+      chunks.push(...frameChunks);
+      onChunks?.(frameChunks);
+    }
+    const merged = mergeChunks(chunks);
+    return { ok: true, thinking: merged.thinking, text: merged.text, chunks, durationMs: Date.now() - t0 };
   }
 
   get isAlive(): boolean { return this.cdp.isConnected; }
