@@ -6,8 +6,8 @@ import net from "node:net";
 import { Cdp, waitFor, type CdpEvent } from "./cdp.js";
 import { parseGenerateContent, parseFrame, mergeChunks, FrameSplitter, type ParsedChunk } from "./parse.js";
 import {
-  contentHash, locateAnchor, mintWithOracle, hasOracleExpr,
-  RAID_HOOK_SETUP, RAID_STEAL_ON_FRAME, uiInjectJs,
+  contentHash, locateAnchor, mintWithOracle, hasOracleExpr, stealExpr, type RaidHandle,
+  RAID_HOOK_SETUP, uiInjectJs,
 } from "./mint.js";
 import { findChrome, config } from "./config.js";
 
@@ -312,7 +312,7 @@ export class AisDriver {
 
     // breakpoint at the token-write; the regex anchor is found from the LIVE bundle text
     await this.cdp.send("Debugger.enable", { maxScriptsCacheSize: 1_000_000_000 }).catch(() => {});
-    let anchor: { line: number; col: number }[] | null = null;
+    let anchor: RaidHandle[] | null = null;
     for (let i = 0; i < 3; i++) {
       try { anchor = await locateAnchor(this.cdp); break; }
       catch (e: any) {
@@ -322,14 +322,14 @@ export class AisDriver {
       }
     }
     if (!anchor) throw new Error("raid anchor not found (bundle updated?)");
-    dbg(`anchors: ${anchor.map(a => a.line + ":" + a.col).join(" | ")}`);
-    const bps: Array<{ id: string; loc: any }> = [];
+    dbg(`anchors: ${anchor.map(a => a.line + ":" + a.col + " fn=" + a.mintFn + " svc=" + a.svc + "." + a.svcField).join(" | ")}`);
+    const bps: Array<{ id: string; names: RaidHandle }> = [];
     for (const a of anchor) {
       const bp = await this.cdp.send("Debugger.setBreakpointByUrl", {
         lineNumber: a.line, columnNumber: a.col,
         urlRegex: "gstatic\\.com/.*m=_b",
       }, 15_000).catch(() => null);
-      if (bp?.locations?.length) bps.push({ id: bp.breakpointId, loc: bp.locations[0] });
+      if (bp?.locations?.length) bps.push({ id: bp.breakpointId, names: a });
     }
     if (!bps.length) throw new Error("raid anchor not resolved (bundle updated?)");
     dbg("breakpoints set: " + bps.length);
@@ -345,10 +345,15 @@ export class AisDriver {
     const paused = await pauseP;
     dbg("paused, frames=" + paused.callFrames.length);
 
+    // pick the anchor-name set matching the breakpoint we actually hit
+    const hitLine = paused.callFrames[0]?.location?.lineNumber;
+    const hitNames = bps.find(b => b.names.line === hitLine || hitLine === undefined)?.names ?? bps[0].names;
+    dbg(`stealing with fn=${hitNames.mintFn} svc=${hitNames.svc}.${hitNames.svcField}`);
+
     // steal from the paused frame
     const steal = await this.cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: paused.callFrames[0].callFrameId,
-      expression: RAID_STEAL_ON_FRAME, returnByValue: true,
+      expression: stealExpr(hitNames), returnByValue: true,
     }, 15_000).catch(() => null);
     const stolen = steal?.result?.value === "stolen";
     dbg("steal: " + (stolen ? "ok" : JSON.stringify(steal)?.slice(0, 120)));

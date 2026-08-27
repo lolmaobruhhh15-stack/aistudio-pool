@@ -11,20 +11,21 @@ export function contentHash(texts: string[]): string {
   return crypto.createHash("sha256").update(texts.join(" ")).digest("hex");
 }
 
-// locate the token-write inside the served bundle at runtime (survives Google pushes
-// better than hardcoded line/col: we re-scan the actual served text every raid)
-const RAID_ANCHOR_NOTE = "anchor: gp(xX.zc,yY);.m(z,5,yY) — searched inside the page at raid time";
-
+// locate the token-write inside the served bundle at runtime, NAME-AGNOSTIC so it
+// survives Google's minified renames (observed rotations: gp->ip, a.zc->a.I, b_b->RZb).
+// The stable fingerprint is: token = yield _.<MINTFN>(<svc>.<field>, token); then the
+// proto field-5 write _.m(<proto>, 5, token). We capture the actual names each raid.
 export interface RaidHandle {
   line: number; col: number;
+  mintFn: string;   // e.g. "gp" or "ip"
+  svc: string;      // controller var, e.g. "a"
+  svcField: string; // field on controller holding the BotGuard service, e.g. "zc" / "I"
 }
 
-/** Fetch the main bundle text from inside the page and locate the _.m(p,5,r) anchor. */
+/** Fetch the main bundle text inside the page and locate every mint-site with its real names. */
 export async function locateAnchor(cdp: Cdp): Promise<RaidHandle[]> {
   const expr = `
     (async () => {
-      // prefer live <script> tags (performance buffer may have evicted the entry);
-      // '/js/' discriminates the JS bundle from the /ss/ stylesheet that shares the m=_b suffix
       const urls = [...document.scripts].map(s => s.src).filter(u => u && u.includes('/js/') && /[?&/]m=_b\\b/.test(u));
       const perf = performance.getEntriesByType('resource').map(r => r.name)
         .filter(u => u.includes('/js/') && /[?&/]m=_b\\b/.test(u));
@@ -37,26 +38,36 @@ export async function locateAnchor(cdp: Cdp): Promise<RaidHandle[]> {
   const r = await cdp.send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }, 45_000);
   const info = JSON.parse(r.result.value);
   if (info.err) throw new Error(info.err);
-  // search in node (we have the text in-page; pull a window around candidate matches)
+  // search in the fetched text (in-page), capturing mint-fn + service + token-var names
   const findExpr = `
     (() => {
       const txt = window.__aisBundleText;
       const out = [];
-      const re = /gp\\((\\w+)\\.zc,(\\w+)\\);\\w*\\.m\\((\\w),5,\\2\\)/g;
-      let m;
-      while ((m = re.exec(txt)) && out.length < 5) {
-        const off = m.index;
-        let line = 0, col = off;
-        const nl = txt.lastIndexOf('\\n', off);
-        if (nl === -1) col = off; else { line = (txt.slice(0, off).match(/\\n/g) || []).length; col = off - nl - 1; }
-        out.push({ line, col, sample: m[0] });
-      }
-      return JSON.stringify(out);
+      const re = /yield\\s+_\\.([\\\\w$]{1,8})\\(\\s*(\\\\w+)\\s*\\.\\s*(\\\\w+),\\s*(\\\\w+)\\s*\\)\\s*;\\s*_\\.m\\((\\\\w+),\\s*5\\s*,\\s*\\{\\{TOKREV\\}\\}\\)/g;
+      // build once with a numeric backref: use a two-pass scan instead to avoid
+      // esbuild/string escaping of \\N inside template literals
+      return re;
     })()`;
-  const r2 = await cdp.send("Runtime.evaluate", { expression: findExpr, returnByValue: true });
-  const hits = JSON.parse(r2.result.value);
+  // Do the scan in Node on the fetched text to avoid nested-regex escaping pain:
+  // pull the text down first by a one-off eval, then re-run a real Node regex.
+  const textExpr = `window.__aisBundleText`;
+  const tRes = await cdp.send("Runtime.evaluate", { expression: textExpr, returnByValue: true }, 20_000);
+  const txt: string = tRes.result.value || "";
+  const hits: RaidHandle[] = [];
+  // mint call: yield _.MINTFN(SVC.field, TOKEN); ... _.m(PROTO, 5, TOKEN)
+  const re = /yield\s+_\.([\w$]{1,8})\(\s*(\w+)\s*\.\s*(\w+)\s*,\s*(\w+)\s*\)\s*;\s*_\.m\(\s*(\w+)\s*,\s*5\s*,\s*(\w+)\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(txt)) && hits.length < 8) {
+    const mintFn = m[1], svc = m[2], svcField = m[3], tokenVar = m[4], proto = m[5], written = m[6];
+    if (tokenVar !== written) continue;      // token must be the same var written into field 5
+    const off = m.index + m[0].lastIndexOf("yield");
+    let line = 0, col = off;
+    const nl = txt.lastIndexOf("\n", off);
+    if (nl === -1) col = off; else { line = (txt.slice(0, off).match(/\n/g) || []).length; col = off - nl - 1; }
+    hits.push({ line, col, mintFn, svc, svcField });
+  }
   if (!hits.length) throw new Error("raid anchor not found in bundle (Google update?)");
-  return hits.map((h: any) => ({ line: h.line as number, col: h.col as number }));
+  return hits;
 }
 
 export const RAID_HOOK_SETUP = `(() => {
@@ -114,11 +125,12 @@ export function hasOracleExpr(): string {
   return `!!(window.__raid && window.__raid.xv && window.__raid.xv.A && window.__raid.gp)`;
 }
 
-/** Steal the oracle from a paused frame (must be called while Debugger is paused in Ezb). */
-export const RAID_STEAL_ON_FRAME = `(() => {
-  try {
-    window.__raid = { xv: a.zc, gp: _.gp, Qv: _.Qv, Iu: _.Iu };
-    window.__raidTokSample = (typeof r !== "undefined" && r) || (typeof U !== "undefined" && U) || (typeof g !== "undefined" && g) || null;
-    return 'stolen';
-  } catch (e) { return 'ERR:' + e.message; }
-})()`;
+/** Build a steal expression for the SPECIFIC names captured at this mint site. */
+export function stealExpr(h: { svc: string; svcField: string; mintFn: string }): string {
+  return `(() => {
+    try {
+      window.__raid = { xv: ${h.svc}.${h.svcField}, gp: _.${h.mintFn} };
+      return 'stolen';
+    } catch (e) { return 'ERR:' + e.message; }
+  })()`;
+}
