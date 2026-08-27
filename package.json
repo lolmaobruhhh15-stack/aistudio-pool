@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
-    "smoke": "tsx src/main.ts --attach 9222 --smoke"
+    "smoke": "tsx src/main.ts --attach 9222 --smoke",
+    "postinstall": "cd web && npm install && npm run build",
+    "build": "cd web && npm install && npm run build"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
