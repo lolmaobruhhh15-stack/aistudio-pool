@@ -101,6 +101,8 @@ function Accounts() {
   const [newName, setNewName] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const [paste, setPaste] = useState("");
+  const [pasteName, setPasteName] = useState("");
 
   const refresh = () => j("/api/accounts").then(d => setAccs(d.accounts || [])).catch(() => {});
   useEffect(() => { refresh(); const iv = setInterval(refresh, 2500); return () => clearInterval(iv); }, []);
@@ -112,8 +114,29 @@ function Accounts() {
     setNote(r.note || r.error || "");
     setNewName(""); setBusy(false); refresh();
   };
+
+  const addPaste = async () => {
+    if (!pasteName.trim() || !paste.trim()) return;
+    setBusy(true);
+    let cookies: any;
+    try { cookies = JSON.parse(paste); } catch { cookies = null; }
+    if (!cookies) { setNote("Paste must be JSON: [{\"name\":\"SAPISID\",\"value\":\"...\",\"domain\":\".google.com\",...}] or the object returned by Export."); setBusy(false); return; }
+    const arr = Array.isArray(cookies) ? cookies : (cookies.cookies || [cookies]);
+    const r = await j("/api/accounts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: pasteName.trim(), cookies: arr }) });
+    setNote(r.note || r.error || (r.ok ? `imported ${r.importedCookies} cookies, state: ${r.account?.state}` : r.error));
+    setPasteName(""); setPaste(""); setBusy(false); refresh();
+  };
+
   const act = async (name: string, what: string) =>
     await j(`/api/accounts/${name}/${what}`, { method: "POST" }).then(refresh);
+
+  const doExport = async (name: string) => {
+    const d = await j(`/api/accounts/${name}/export`);
+    if (d.cookies) {
+      await navigator.clipboard.writeText(JSON.stringify(d.cookies));
+      setNote(`Exported ${d.cookies.length} cookies for "${name}" to clipboard — paste into another deployment's Add-account box.`);
+    } else setNote("Export failed: " + (d.error || ""));
+  };
 
   return (
     <div className="space-y-4">
@@ -128,8 +151,25 @@ function Accounts() {
             {busy ? "…" : "Launch"}
           </button>
         </div>
-        {note && <div className="mt-2 text-xs text-amber-400/90 leading-relaxed">{note}</div>}
+        <div className="mt-2 text-[11px] text-slate-500">"Launch" opens a headed Chrome window to sign in manually. For cloud/headless, paste cookies below instead.</div>
       </div>
+
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+        <div className="text-sm font-medium text-slate-300 mb-2">Add account from pasted cookies (cloud / cookie-paste — no login UI)</div>
+        <div className="flex gap-2 mb-2">
+          <input value={pasteName} onChange={e => setPasteName(e.target.value)} placeholder="account name"
+            className="w-40 bg-black/30 border border-white/10 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-indigo-500/50" />
+        </div>
+        <textarea value={paste} onChange={e => setPaste(e.target.value)} rows={3} placeholder='Paste cookie JSON: [{"name":"SAPISID","value":"...","domain":".google.com","path":"/","secure":true,"httpOnly":true}]'
+          className="w-full bg-black/30 border border-white/10 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-indigo-500/50 font-mono text-[11px] resize-y" />
+        <button disabled={busy || !pasteName.trim() || !paste.trim()} onClick={addPaste}
+          className="mt-2 px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-sm font-medium text-white transition">
+          {busy ? "…" : "Import cookies"}
+        </button>
+        <div className="mt-2 text-[11px] text-slate-500">Cut/paste the JSON from an Export in another deployment, or from a docs script — Google login never happens on this host.</div>
+      </div>
+
+      {note && <div className="text-xs text-amber-400/90 leading-relaxed border border-amber-500/20 rounded-xl p-3 bg-amber-500/5">{note}</div>}
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {accs.map(a => (
@@ -150,13 +190,15 @@ function Accounts() {
             </div>
             <div className="mt-2 text-[11px] text-slate-500">last used {rel(a.stats.lastUsed)} · cdp {a.alive ? "live" : "down"}</div>
             {a.stats.lastError && <div className="mt-1 text-[11px] text-rose-400/80 truncate" title={a.stats.lastError}>{a.stats.lastError}</div>}
-            <div className="mt-3 flex gap-2">
+            <div className="mt-3 flex gap-2 flex-wrap">
               <button onClick={() => act(a.name, a.state === "paused" ? "pause" : "pause")}
                 className="flex-1 text-xs py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition">
                 {a.state === "paused" ? "Resume" : "Pause"}
               </button>
               <button onClick={() => act(a.name, "refresh")}
                 className="flex-1 text-xs py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition">Refresh</button>
+              <button onClick={() => doExport(a.name)}
+                className="flex-1 text-xs py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition">Export</button>
               {a.name !== "main" && (
                 <button onClick={() => { if (confirm(`Remove ${a.name}? (profile kept on disk)`)) j(`/api/accounts/${a.name}`, { method: "DELETE" }).then(refresh); }}
                   className="text-xs py-2 px-3 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 transition">✕</button>
