@@ -388,6 +388,52 @@ export class AisDriver {
   }
 
   /**
+   * Harvest the browser's live UA + client hints so raw-send headers match the
+   * context that minted the token (Chrome auto-updates break hardcoded values).
+   */
+  async clientHeaders(): Promise<Record<string, string>> {
+    const expr = `(async () => {
+      const ua = navigator.userAgent;
+      let h = {};
+      try { h = await navigator.userAgentData.getHighEntropyValues(["architecture","bitness","formFactors","model","platform","platformVersion","fullVersionList","wow64"]); } catch {}
+      const brands = (navigator.userAgentData?.brands || []).map(b => '"' + b.brand + '";v="' + b.version + '"').join(', ');
+      const fvl = (h.fullVersionList || []).map(b => '"' + b.brand + '";v="' + b.version + '"').join(', ');
+      return JSON.stringify({
+        ua,
+        chUA: brands,
+        chMobile: navigator.userAgentData?.mobile ? "?0" : "?0",
+        chPlatform: '"' + ((h.platform) || '') + '"',
+        chArch: '"' + ((h.architecture) || '') + '"',
+        chBitness: '"' + ((h.bitness) || '') + '"',
+        chFVL: fvl,
+        chModel: '""',
+        chPlatformVersion: '"' + ((h.platformVersion) || '') + '"',
+        chWow64: h.wow64 ? "?0" : "?0",
+        chFormFactors: (h.formFactors || []).join(','),
+      });
+    })()`;
+    const raw = await this.evalJs(expr, 15_000, true).catch(() => null);
+    if (!raw) return {};
+    try {
+      const d = JSON.parse(raw);
+      const out: Record<string, string> = {
+        "User-Agent": d.ua,
+        "sec-ch-ua": d.chUA,
+        "sec-ch-ua-mobile": d.chMobile,
+        "sec-ch-ua-platform": d.chPlatform,
+        "sec-ch-ua-arch": d.chArch,
+        "sec-ch-ua-bitness": d.chBitness,
+        "sec-ch-ua-full-version-list": d.chFVL,
+        "sec-ch-ua-model": d.chModel,
+        "sec-ch-ua-platform-version": d.chPlatformVersion,
+        "sec-ch-ua-wow64": d.chWow64,
+        "sec-ch-ua-form-factors": d.chFormFactors,
+      };
+      return out;
+    } catch { return {}; }
+  }
+
+  /**
    * v2 chat: mint token for arbitrary messages, raw-HTTP send, TRUE streaming.
    * onChunks fires per network chunk as frames complete.
    */
@@ -416,6 +462,7 @@ export class AisDriver {
     const { cookie, authorization } = authFrom(cookies);
     const tz = await this.evalJs("Intl.DateTimeFormat().resolvedOptions().timeZone", 10_000).catch(() => "UTC");
     const body = JSON.stringify(buildBody(model, turns, token, opts, String(tz)));
+    const ch = await this.clientHeaders();
 
     const res = await fetch(RPC_URL, {
       method: "POST",
@@ -428,8 +475,8 @@ export class AisDriver {
         "X-User-Agent": "grpc-web-javascript/0.1",
         "Origin": "https://aistudio.google.com",
         "Referer": "https://aistudio.google.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
         "Cookie": cookie,
+        ...ch,
       },
       body,
     });
