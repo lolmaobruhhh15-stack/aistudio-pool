@@ -23,10 +23,42 @@ const rel = (t?: number) => !t ? "—" : `${Math.max(0, Math.round((Date.now() -
 export default function App() {
   const [tab, setTab] = useState<"accounts" | "play" | "log">("accounts");
   const [stats, setStats] = useState<Stats | null>(null);
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pwErr, setPwErr] = useState("");
   useEffect(() => {
-    const tick = () => j("/api/stats").then(setStats).catch(() => {});
-    tick(); const iv = setInterval(tick, 2500); return () => clearInterval(iv);
+    j("/api/auth/check").then(d => { setAuthed(d.authed); setAuthRequired(d.authRequired); }).catch(() => setAuthed(false));
   }, []);
+  useEffect(() => {
+    if (!authed) return;
+    const tick = () => j("/api/stats").then(setStats).catch(r => { if (r?.status === 401) setAuthed(false); });
+    tick(); const iv = setInterval(tick, 2500); return () => clearInterval(iv);
+  }, [authed]);
+
+  const login = async () => {
+    setPwErr("");
+    const res = await fetch("/api/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: pw }) });
+    if (res.ok) { setAuthed(true); setPw(""); }
+    else { const d = await res.json().catch(() => ({})); setPwErr(d.error || "login failed"); }
+  };
+
+  if (authed === false) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-white/[0.03] p-6 space-y-4">
+          <div className="text-lg font-semibold bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">AI Studio Pool</div>
+          <div className="text-xs text-slate-500">Enter the dashboard password to continue.</div>
+          <input type="password" value={pw} onChange={e => setPw(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && login()}
+            placeholder="password"
+            className="w-full bg-black/30 border border-white/10 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-indigo-500/50" />
+          {pwErr && <div className="text-xs text-rose-400">{pwErr}</div>}
+          <button onClick={login} className="w-full py-2.5 rounded-xl bg-indigo-500 hover:bg-indigo-400 text-sm font-medium text-white transition">Sign in</button>
+        </div>
+      </div>
+    );
+  }
 
   const tabs = [
     { id: "accounts", label: "Accounts", icon: "▦" },
@@ -48,6 +80,7 @@ export default function App() {
             <span className="mr-2">{t.icon}</span>{t.label}
           </button>
         ))}
+        <AuthControls onLogout={() => setAuthed(false)} />
         <StatsBar stats={stats} className="mt-auto" />
       </aside>
 
@@ -58,6 +91,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 p-4 pb-24 md:pb-8 overflow-x-hidden">
+        <div className="md:hidden mb-4"><AuthControls onLogout={() => setAuthed(false)} /></div>
         {tab === "accounts" && <Accounts />}
         {tab === "play" && <Playground />}
         {tab === "log" && <LogView />}
@@ -72,6 +106,35 @@ export default function App() {
           </button>
         ))}
       </nav>
+    </div>
+  );
+}
+
+function AuthControls({ onLogout }: { onLogout: () => void }) {
+  const [curPw, setCurPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const change = async () => {
+    setMsg("");
+    const res = await fetch("/api/auth/password", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ oldPassword: curPw, newPassword: newPw }) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok) { setMsg("password updated"); setCurPw(""); setNewPw(""); }
+    else setMsg(d.error || "failed");
+  };
+  const logout = async () => { await fetch("/api/auth/logout", { method: "POST" }).catch(() => {}); onLogout(); };
+  return (
+    <div className="mt-2 space-y-2">
+      <div className="text-[11px] text-slate-500 font-medium">Auth</div>
+      <input type="password" value={curPw} onChange={e => setCurPw(e.target.value)} placeholder="current password"
+        className="w-full bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-[11px] outline-none focus:border-indigo-500/50" />
+      <input type="password" value={newPw} onChange={e => setNewPw(e.target.value)} placeholder="new password"
+        className="w-full bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-[11px] outline-none focus:border-indigo-500/50" />
+      {msg && <div className="text-[10px] text-amber-400">{msg}</div>}
+      <div className="flex gap-2">
+        <button onClick={change} disabled={!curPw || !newPw}
+          className="flex-1 text-[11px] py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 disabled:opacity-40 transition">Change</button>
+        <button onClick={logout} className="text-[11px] py-1.5 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 transition">Logout</button>
+      </div>
     </div>
   );
 }

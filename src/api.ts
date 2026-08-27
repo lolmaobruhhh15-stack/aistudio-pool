@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { AccountPool, transcript } from "./pool.js";
 import { config } from "./config.js";
+import { Auth } from "./auth.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +27,21 @@ export async function buildServer(pool: AccountPool) {
   const app = Fastify({ logger: false, bodyLimit: 4 * 1024 * 1024 });
   await app.register(cors, {});
 
+  const auth = new Auth();
+  const SESSION = "ais_sess";
+
+  // gate /api/* (admin/panel) + dashboard behind the password; /v1 and /health are separate
+  const openApiPaths = ["/api/auth/login", "/api/auth/check"];
+  app.addHook("onRequest", async (req, reply) => {
+    const url = req.url.split("?")[0];
+    if (url.startsWith("/v1/") || url === "/health") return;
+    if (!url.startsWith("/api/")) return; // HTML/assets free; the SPA itself gates via /check
+    if (!auth.enabled) return;
+    if (openApiPaths.includes(url)) return;
+    const tok = (req.headers["cookie"] || "").match(/(?:^|;\s*)ais_sess=([a-f0-9]+)/)?.[1];
+    if (!auth.valid(tok)) return reply.code(401).send({ error: "unauthorized" });
+  });
+
   const log: LogEntry[] = [];
   const pushLog = (e: LogEntry) => { log.push(e); if (log.length > 300) log.shift(); };
 
@@ -37,6 +53,36 @@ export async function buildServer(pool: AccountPool) {
   };
 
   app.get("/health", async () => ({ ok: true, accounts: pool.accounts.length }));
+
+  // ---- auth (open) ----
+  app.get("/api/auth/check", async (req, reply) => {
+    const tok = (req.headers["cookie"] || "").match(/(?:^|;\s*)ais_sess=([a-f0-9]+)/)?.[1];
+    return { authed: !auth.enabled || auth.valid(tok), authRequired: auth.enabled };
+  });
+
+  app.post("/api/auth/login", async (req, reply) => {
+    const { password } = req.body as any;
+    const tok = auth.login(String(password ?? ""));
+    if (!tok) return reply.code(401).send({ error: "invalid password" });
+    reply.header("Set-Cookie", `ais_sess=${tok}; Path=/; HttpOnly; SameSite=Lax${config.production ? "; Secure" : ""}`);
+    return { ok: true };
+  });
+
+  app.post("/api/auth/logout", async (req) => {
+    const tok = (req.headers["cookie"] || "").match(/(?:^|;\s*)ais_sess=([a-f0-9]+)/)?.[1];
+    auth.logout(tok);
+    return { ok: true };
+  });
+
+  app.post("/api/auth/password", async (req, reply) => {
+    const { oldPassword, newPassword } = req.body as any;
+    const r = auth.changePassword(String(oldPassword ?? ""), String(newPassword ?? ""));
+    if (!r.ok) return reply.code(400).send({ error: r.error });
+    // re-issue a session so the current caller stays logged in
+    const tok = auth.login(newPassword);
+    if (tok) reply.header("Set-Cookie", `ais_sess=${tok}; Path=/; HttpOnly; SameSite=Lax${config.production ? "; Secure" : ""}`);
+    return { ok: true };
+  });
 
   app.get("/v1/models", { preHandler: requireKey }, async () => ({
     object: "list",

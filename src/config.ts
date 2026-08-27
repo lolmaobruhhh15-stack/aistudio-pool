@@ -17,6 +17,7 @@ export const config = {
   ].filter(Boolean) as string[],
   accountsDir: process.env.ACCOUNTS_DIR || path.join(ROOT, "accounts"),
   apiKeys: (process.env.API_KEYS || "").split(",").map(s => s.trim()).filter(Boolean),
+  production: (process.env.NODE_ENV || "").toLowerCase() === "production",
   chatTimeoutMs: Number(process.env.CHAT_TIMEOUT_MS || 180_000),
   defaultModel: process.env.DEFAULT_MODEL || "gemini-3.1-pro-preview",
 };
