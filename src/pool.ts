@@ -117,7 +117,7 @@ export class AccountPool {
         result = await acc.driver!.chatV2(messages, model, opts, onChunks);
       } catch (err: any) {
         const msg = String(err?.message || err);
-        if (/raid|oracle|anchor|breakpoint/i.test(msg)) {
+        if (/raid|oracle|anchor|breakpoint|PERMISSION_DENIED/i.test(msg)) {
           if (process.env.AIS_DEBUG) console.log(`[pool] v2 failed for ${acc.name}, falling back legacy: ${msg}`);
           via = "legacy";
           result = await acc.driver!.chat(transcript(messages), model);

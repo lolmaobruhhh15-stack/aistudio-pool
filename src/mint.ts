@@ -45,7 +45,7 @@ export async function locateAnchor(cdp: Cdp): Promise<RaidHandle[]> {
       const re = /gp\\((\\w+)\\.zc,(\\w+)\\);\\w*\\.m\\((\\w),5,\\2\\)/g;
       let m;
       while ((m = re.exec(txt)) && out.length < 5) {
-        const off = m.index + m[0].lastIndexOf('.m(');
+        const off = m.index;
         let line = 0, col = off;
         const nl = txt.lastIndexOf('\\n', off);
         if (nl === -1) col = off; else { line = (txt.slice(0, off).match(/\\n/g) || []).length; col = off - nl - 1; }

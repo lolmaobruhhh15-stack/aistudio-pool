@@ -56,7 +56,7 @@ function buildBody(model: string, messages: ChatMessage[], token: string, opts: 
     turns,
     SAFETY,
     [null, null, null,
-      opts.maxTokens ?? 65536, 1, opts.topP ?? 0.95, 64,
+      opts.maxTokens ?? 65536, opts.temperature ?? 1, opts.topP ?? 0.95, 64,
       null, null, null, null, null, null, 1,
       null, null,
       [1, null, null, thinkingTail],
@@ -359,6 +359,14 @@ export class AisDriver {
 
     // drain the probe's own GenerateContent capture so it can't confuse legacy paths
     this.bodies.clear();
+    // wait for the probe chat to complete (interpreter warms up during the first page-driven chat)
+    dbg("waiting for probe to complete...");
+    await waitFor(async () => {
+      try {
+        const v = await this.evalJs("location.pathname.includes('/prompts/') && !location.pathname.includes('/new_chat')", 5_000);
+        return v === true;
+      } catch { return false; }
+    }, 60_000, "probe completion").catch(() => dbg("probe completion wait timed out"));
     this.oracleModel = model;
   }
 
@@ -399,6 +407,9 @@ export class AisDriver {
     if (sys) turns.unshift({ role: "user", content: "[System instructions]\n" + sys });
 
     const hex = contentHash(turns.map(t => t.content));
+    // interpreter refreshes on tab visibility; make sure the page is frontmost before minting
+    try { await this.cdp.send("Page.bringToFront", {}, 5_000); } catch {}
+    await new Promise(r => setTimeout(r, 800));
     const token = await mintWithOracle(this.cdp, hex);
 
     const cookies = (await this.cdp.send("Storage.getCookies", {}, 15_000)).cookies || [];
