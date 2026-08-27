@@ -65,6 +65,19 @@ export class AccountPool {
     return acc;
   }
 
+  /** Launch a HEADLESS account (for cookie-paste flows that don't need a login UI). */
+  async addAccountHeadless(name: string): Promise<Account> {
+    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const acc = new Account(safe);
+    this.accounts.push(acc);
+    this.startDriver(acc, true).catch(err => { acc.state = "error"; acc.stats.lastError = String(err); });
+    return acc;
+  }
+
+  findAccount(name: string): Account | undefined {
+    return this.accounts.find(a => a.name === name);
+  }
+
   /** Close an account's browser and drop it from the pool (profile dir is kept). */
   async removeAccount(name: string): Promise<boolean> {
     const i = this.accounts.findIndex(a => a.name === name);

@@ -12,6 +12,11 @@ const MODELS = [
   "gemini-3-flash-preview", "gemini-3.7-flash", "gemini-2.5-pro", "gemini-2.5-flash",
 ];
 
+// browser pane toggle: OFF by default (normal local CDP + headed login windows).
+// ON = cloud/embedded mode: the in-website screenshot/click browser pane serves logins.
+let localBrowserPaneEnabled = (process.env.BROWSER_PANE || "").toLowerCase() === "1";
+const browserPaneEnabled = () => localBrowserPaneEnabled;
+
 export interface LogEntry {
   t: number; model: string; account: string; ms: number;
   ok: boolean; error?: string; stream: boolean; promptPreview: string;
@@ -117,10 +122,97 @@ export async function buildServer(pool: AccountPool) {
   });
 
   app.post("/api/accounts", async (req) => {
-    const { name } = req.body as any;
+    const { name, cookies, mode } = req.body as any;
     if (!name) return { error: "name required" };
+    if (cookies) {
+      // cookie-paste import: launch headless (no login UI needed), inject cookies, verify
+      const acc = await pool.addAccountHeadless(name);
+      await new Promise(r => setTimeout(r, 4000)); // let the browser come up
+      try {
+        const n = await acc.driver!.importCookies(cookies);
+        acc.state = (await acc.driver!.isLoggedIn()) ? "idle" : "logged_out";
+        return { ok: true, account: acc.info(), importedCookies: n };
+      } catch (e: any) {
+        acc.state = "error"; acc.stats.lastError = String(e?.message || e);
+        return { ok: false, error: String(e?.message || e) };
+      }
+    }
     const acc = await pool.addAccount(name);
     return { ok: true, account: acc.info(), note: "headed Chrome launched — sign into Google in that window, then POST /api/accounts/" + acc.name + "/refresh" };
+  });
+
+  // cookie export: dump an account's Google cookies as paste-ready JSON
+  app.get("/api/accounts/:name/export", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver) return { error: "not found" };
+    try {
+      const cookies = await acc.driver.exportCookies();
+      return { ok: true, account: acc.name, count: cookies.length, cookies };
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e) };
+    }
+  });
+
+  app.post("/api/accounts/:name/import", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver) return { error: "not found" };
+    const cookies = (req.body as any)?.cookies;
+    if (!Array.isArray(cookies) || !cookies.length) return { error: "cookies array required" };
+    try {
+      const n = await acc.driver.importCookies(cookies);
+      acc.state = (await acc.driver.isLoggedIn()) ? "idle" : "logged_out";
+      return { ok: true, account: acc.name, imported: n, state: acc.state };
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e) };
+    }
+  });
+
+  // ---- manual browser panel (glm2api-style, no VNC) ----
+  app.get("/api/browser/:name/screenshot", async (req, reply) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver || !browserPaneEnabled()) return reply.code(404).send({ error: "no browser pane" });
+    const img = await acc.driver.screenshot();
+    return reply.type("image/jpeg").send(Buffer.from(img, "base64"));
+  });
+
+  app.post("/api/browser/:name/click", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver || !browserPaneEnabled()) return { error: "no browser pane" };
+    const { x, y } = req.body as any;
+    await acc.driver.mouseClick(Number(x), Number(y));
+    return { ok: true };
+  });
+
+  app.post("/api/browser/:name/type", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver || !browserPaneEnabled()) return { error: "no browser pane" };
+    const { text } = req.body as any;
+    await acc.driver.typeText(String(text ?? ""));
+    return { ok: true };
+  });
+
+  app.post("/api/browser/:name/key", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver || !browserPaneEnabled()) return { error: "no browser pane" };
+    const { key } = req.body as any;
+    await acc.driver.keyPress(String(key ?? ""));
+    return { ok: true };
+  });
+
+  app.post("/api/browser/:name/drag", async (req) => {
+    const acc = pool.findAccount((req.params as any).name);
+    if (!acc?.driver || !browserPaneEnabled()) return { error: "no browser pane" };
+    const { x1, y1, x2, y2 } = req.body as any;
+    await acc.driver.drag(Number(x1), Number(y1), Number(x2), Number(y2));
+    return { ok: true };
+  });
+
+  // ---- browser-pane toggle (cloud embedded browser) ----
+  app.get("/api/settings/browser-pane", async () => ({ enabled: browserPaneEnabled() }));
+  app.post("/api/settings/browser-pane", async (req) => {
+    const on = Boolean((req.body as any)?.on);
+    localBrowserPaneEnabled = on;
+    return { enabled: on, note: on ? "embedded browser pane ON (cloud mode)" : "embedded browser pane OFF (normal local CDP)" };
   });
 
   app.post("/api/accounts/:name/refresh", async (req) => {

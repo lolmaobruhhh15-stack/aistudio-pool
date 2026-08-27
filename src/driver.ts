@@ -516,6 +516,72 @@ export class AisDriver {
     return { ok: true, thinking: merged.thinking, text: merged.text, chunks, durationMs: Date.now() - t0 };
   }
 
+  // ---------------- account cookies: export / paste-import ----------------
+
+  /** Dump this account's Google cookies (ready to paste into another deployment). */
+  async exportCookies(): Promise<any[]> {
+    await this.ensureConnected();
+    const r = await this.cdp.send("Storage.getCookies", {}, 15_000);
+    const all = (r.cookies || []) as any[];
+    return all
+      .filter(c => (c.domain || "").endsWith("google.com"))
+      .map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path,
+                   secure: !!c.secure, httpOnly: !!c.httpOnly, sameSite: c.sameSite ?? "Lax", expires: c.expires ?? -1 }));
+  }
+
+  /** Inject a pasted cookie list into this browser profile (Storage.setCookies batch). */
+  async importCookies(cookies: any[]): Promise<number> {
+    await this.ensureConnected();
+    const payload = cookies.map(c => ({
+      name: c.name, value: c.value, domain: c.domain, path: c.path ?? "/",
+      secure: !!c.secure, httpOnly: !!c.httpOnly,
+      sameSite: ["Strict", "Lax", "Extended", "None"].includes(c.sameSite) ? c.sameSite : "Lax",
+      expires: c.expires ?? -1,
+    }));
+    await this.cdp.send("Storage.setCookies", { cookies: payload }, 20_000);
+    return payload.length;
+  }
+
+  // ---------------- manual browser panel (NO VNC — served over HTTP) ----------------
+
+  async screenshot(): Promise<string> {
+    await this.ensureConnected();
+    const r = await this.cdp.send("Page.captureScreenshot", { format: "jpeg", quality: 60 }, 20_000);
+    return r.data as string; // base64 jpeg
+  }
+
+  async mouseClick(x: number, y: number): Promise<void> {
+    await this.ensureConnected();
+    await this.cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, 10_000);
+    await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, 10_000);
+  }
+
+  async typeText(text: string): Promise<void> {
+    await this.ensureConnected();
+    await this.cdp.send("Input.insertText", { text }, 10_000);
+  }
+
+  async keyPress(key: string): Promise<void> {
+    await this.ensureConnected();
+    const names: Record<string, string> = { enter: "Enter", return: "Enter", tab: "Tab", esc: "Escape", backspace: "Backspace", delete: "Delete", space: " ", arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight" };
+    const k = names[key.toLowerCase()] ?? key;
+    await this.cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: k, code: k, windowsVirtualKeyCode: k.length === 1 ? k.charCodeAt(0) : 13, text: k.length === 1 ? k : undefined }, 10_000);
+    await this.cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code: k }, 10_000);
+  }
+
+  async drag(x1: number, y1: number, x2: number, y2: number): Promise<void> {
+    await this.ensureConnected();
+    await this.cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: x1, y: y1, button: "left", clickCount: 1 }, 10_000);
+    const steps = 12;
+    for (let i = 1; i <= steps; i++) {
+      const x = x1 + (x2 - x1) * i / steps;
+      const y = y1 + (y2 - y1) * i / steps;
+      await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "left" }, 10_000);
+      await new Promise(r => setTimeout(r, 20));
+    }
+    await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: x2, y: y2, button: "left", clickCount: 1 }, 10_000);
+  }
+
   get isAlive(): boolean { return this.cdp.isConnected; }
 
   async close() {
