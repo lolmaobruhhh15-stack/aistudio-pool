@@ -1,0 +1,20 @@
+[
+ {
+  "name": "acc2",
+  "profilePath": "C:\\Users\\Pedp4WPBX5105GRF0322\\.zcode\\workspace\\default\\tmp\\acc2-profile",
+  "cdpPort": 9224,
+  "alive": true,
+  "launchCmd": "\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\" --remote-debugging-port=9224 --user-data-dir=C:\\Users\\Pedp4WPBX5105GRF0322\\.zcode\\workspace\\default\\tmp\\acc2-profile --no-first-run --no-default-browser-check --disable-blink-features=AutomationControlled --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --window-size=1366,732 https://aistudio.google.com/prompts/new_chat",
+  "pid": "14472",
+  "updatedAt": 1787883832879
+ },
+ {
+  "name": "main",
+  "profilePath": "C:\\Users\\Pedp4WPBX5105GRF0322\\.zcode\\workspace\\default\\tmp\\aistudio-chrome-profile",
+  "cdpPort": 9222,
+  "alive": true,
+  "launchCmd": "\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\" --remote-debugging-port=9222 --user-data-dir=C:\\Users\\Pedp4WPBX5105GRF0322\\.zcode\\workspace\\default\\tmp\\aistudio-chrome-profile --no-first-run --no-default-browser-check --disable-blink-features=AutomationControlled --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion --window-size=1366,732 https://aistudio.google.com/prompts/new_chat",
+  "pid": "17576",
+  "updatedAt": 1787883830867
+ }
+]
